@@ -1,13 +1,55 @@
 apply plugin: 'maven-publish'
 apply plugin: 'kotlin-android'
 apply plugin: 'org.jetbrains.dokka'
+apply from: './publish-pom.gradle'
 
-def libOutputDir = "$buildDir/../../../Detox-android"
+String TARGET_LOCAL_DIR = "$buildDir/../../../Detox-android"
+String TARGET_MAVEN_CENTRAL_URL = 'https://oss.sonatype.org/service/local/staging/deploy/maven2'
 
-// The official javadoc equivalent that supports kotlin KDoc (see https://github.com/Kotlin/dokka)
+String PUB_FLAVOUR_FULL_DETOX = 'full'
+String PUB_FLAVOUR_DETOX_NATIVE = 'coreNative'
+
+String _versionName = System.getProperty('version')
+String _flavour = System.getProperty('pubFlavour', PUB_FLAVOUR_FULL_DETOX)
+
+String _mavenRepoUrl
+Map _mavenCredentials
+
+def _selectedVariant
+
+def initPublishing = {
+    switch (_flavour) {
+        case PUB_FLAVOUR_FULL_DETOX:
+            _mavenRepoUrl = TARGET_LOCAL_DIR
+            _mavenCredentials = null
+            break
+
+        case PUB_FLAVOUR_DETOX_NATIVE:
+            _mavenRepoUrl = TARGET_MAVEN_CENTRAL_URL
+            _mavenCredentials = [
+                    // This should come from ~/.gradle.properties
+                    username: sonatypeUsername,
+                    password: sonatypePassword,
+            ]
+            break
+
+        default:
+            assertNull(_flavour, "Don\'t know how to publish by flavour '${_flavour}'. Try '${PUB_FLAVOUR_FULL_DETOX}' or '${PUB_FLAVOUR_DETOX_NATIVE}'.")
+            break
+    }
+}
+
+def onPrePublishing = {
+    assertDefined(_versionName, "Publishing: Version not specified (run 'gradle publish' with a -Dversion=1.2.3 argument)")
+    logger.lifecycle("Publishing '$_versionName' to: ${_mavenRepoUrl}, based on build-variant '${_selectedVariant.name}'")
+}
+
+initPublishing()
+
+// Dokka is the official javadoc equivalent that supports kotlin KDoc (see https://github.com/Kotlin/dokka)
 dokka {
 
-    // Note: this only remains valid as long as we didn't move kotlin code to src/main/kotlin instead fo src/main/java.
+    // Note: this only remains valid as long as we don't move kotlin code to src/main/kotlin instead of src/main/java.
     // Will have to keep this up to date if we decided to do so.
     sourceDirs = files(android.sourceSets.main.java.srcDirs)
 
@@ -24,7 +66,6 @@ dokka {
 
     outputFormat = 'javadoc' // https://github.com/Kotlin/dokka#output-formats
     outputDirectory = "$buildDir/dokkaDoc" // Temp 'exploded' dir for .jar creation (i.e. by dokkaDocJar task)
-
 
     def suppressedPackages = ["android_libs", "com.wix.detox.espresso.common.annot"]
     for (String packagePrefix: suppressedPackages) {
@@ -54,19 +95,15 @@ task sourcesJar(type: Jar) {
 project.afterEvaluate {
     project.tasks.all { Task task ->
         android.libraryVariants.all { variant ->
-            def v = variant.name.capitalize()
-            if (task.name == "publishMaven${v}AarPublicationToMavenRepository") {
-                task.dependsOn "assemble${v}"
+            String variantName = variant.name.capitalize()
+            if (task.name == "publishMaven${variantName}AarPublicationToMavenRepository") {
+                task.dependsOn "assemble${variantName}"
 
-                // NOTE: Must "inject" this before actual publishing task run instead of inside publications def (see
-                // below) because publications runs in the configuration phase (i.e. otherwise the check would run - and
-                // fail, for *any* running gradle task, not just for publishing tasks).
+                // NOTE: Must "inject" this before actual publishing task run instead of inside publications { ... } closure (see
+                // below) because publications runs in the configuration phase, and this is only run if actual publication is
+                // going to be made.
                 task.doFirst {
-                    def versionName = System.getProperty('version')
-                    if (versionName == null) {
-                        throw new IllegalStateException("Publishing: Version not specified (should run 'gradle publish' with a -Dversion=1.2.3)")
-                    }
-                    logger.lifecycle("Publishing '$versionName' to: $libOutputDir")
+                    onPrePublishing()
                 }
             }
         }
@@ -76,24 +113,31 @@ project.afterEvaluate {
 publishing {
     repositories {
         maven {
-            url = "$libOutputDir"
+            url _mavenRepoUrl
+            if (_mavenCredentials != null) {
+                credentials {
+                    username _mavenCredentials.username
+                    password _mavenCredentials.password
+                }
+            }
         }
     }
 
     publications {
         android.libraryVariants.all { variant ->
-            if (variant.buildType.name == 'release') {
-                def versionName = System.getProperty('version')
+            if (isReleaseVariant(variant) && isVariantOfProductFlavour(variant, _flavour)) {
+                _selectedVariant = variant
 
                 "maven${variant.name.capitalize()}Aar"(MavenPublication) {
                     groupId 'com.wix'
                     artifactId 'detox'
-                    version "$versionName"
+                    version "$_versionName"
 
-                    // Register .aar as artifacts
+                    // Register built .aar as artifact
                     variant.outputs.forEach { output ->
                         artifact output.outputFile
                     }
+
                     // Register sources, javadoc as artifacts
                     artifact sourcesJar
                     artifact dokkaDocJar
@@ -110,51 +154,36 @@ publishing {
                         }
                         licenses {
                             license {
-                                name = "The MIT License"
-                                url = "https://github.com/wix/Detox/blob/master/LICENSE"
+                                name = 'The MIT License'
+                                url = 'https://github.com/wix/Detox/blob/master/LICENSE'
                             }
                         }
                     }
 
                     // Add detox dependencies to the .pom
-                    pom.withXml {
-                        final rootNode = asNode().appendNode('dependencies')
-                        addConfigurationDependencies(rootNode, configurations.api, "compile")
-                        addConfigurationDependencies(rootNode, configurations.compile, "compile")
-                        addConfigurationDependencies(rootNode, configurations.implementation, "runtime")
-                    }
+                    buildPomXmlDependencies(pom, configurations)
                 }
             }
         }
     }
+}
 
-    // Based on https://stackoverflow.com/a/42160584/453052
-    ext.addConfigurationDependencies = { rootNode, Configuration configuration, String scope ->
-        configuration.dependencies.each { dep -> addChildDependency(rootNode, dep, scope) }
+private static def isReleaseVariant(variant) {
+    return variant.buildType.name == 'release'
+}
+
+private static def isVariantOfProductFlavour(variant, flavourName) {
+    return variant.productFlavors.name.find { name -> name == flavourName } != null
+}
+
+private static def assertDefined(target, message) {
+    if (target == null) {
+        throw new IllegalArgumentException(message)
     }
+}
 
-    ext.addChildDependency = { rootNode, Dependency dep, String scope ->
-        if (dep.group == null || dep.version == null || dep.name == null || dep.name == "unspecified")
-            return
-
-        final childNode = rootNode.appendNode('dependency')
-        childNode.appendNode('groupId', dep.group)
-        childNode.appendNode('artifactId', dep.name)
-        childNode.appendNode('version', dep.version)
-        childNode.appendNode('scope', scope)
-
-        if (!dep.transitive) {
-            // If this dependency is transitive, we should force exclude all its dependencies them from the POM
-            final exclusionNode = childNode.appendNode('exclusions').appendNode('exclusion')
-            exclusionNode.appendNode('groupId', '*')
-            exclusionNode.appendNode('artifactId', '*')
-        } else if (!dep.properties.excludeRules.empty) {
-            // Otherwise add specified exclude rules
-            final exclusionNode = childNode.appendNode('exclusions').appendNode('exclusion')
-            dep.properties.excludeRules.each { ExcludeRule rule ->
-                exclusionNode.appendNode('groupId', rule.group ?: '*')
-                exclusionNode.appendNode('artifactId', rule.module ?: '*')
-            }
-        }
+private static def assertNull(target, message) {
+    if (target != null) {
+        throw new IllegalArgumentException(message)
     }
 }
